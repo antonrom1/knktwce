@@ -56,6 +56,8 @@
 #include <syslog.h>
 #include <pcap.h>
 #include <errno.h>
+#include <stdint.h>
+#include <oath/oath.h>
 #include "list.h"
 
 #if __APPLE__
@@ -63,7 +65,7 @@
 extern int daemon(int, int);
 #endif
 
-static char version[] = "0.8";
+static char version[] = "0.9";
 
 #define SEQ_TIMEOUT 25 /* default knock timeout in seconds */
 #define CMD_TIMEOUT 10 /* default timeout in seconds between start and stop commands */
@@ -97,6 +99,9 @@ typedef struct opendoor {
 	FILE *one_time_sequences_fd;
 	char *pcap_filter_exp;
 	char *pcap_filter_expv6;
+	char  *totp_secret;  // b64
+	unsigned int totp_digits;
+	uint64_t last_ctr_seen;  // for single use of TOTP token
 } opendoor_t;
 PMList *doors = NULL;
 
@@ -127,6 +132,7 @@ char* strtoupper(char *str);
 char* trim(char *str);
 void runCommand(char *cmd);
 int parseconfig(char *configfile);
+static void door_update_totp(opendoor_t *d);
 int parse_port_sequence(char *sequence, opendoor_t *door);
 int get_new_one_time_sequence(opendoor_t *door);
 long get_next_one_time_sequence(opendoor_t *door);
@@ -189,6 +195,8 @@ int main(int argc, char **argv)
 		{"version",   no_argument,       0, 'V'},
 		{0, 0, 0, 0}
 	};
+	
+	oath_init();
 
 	while((opt = getopt_long(argc, argv, "4vDdli:c:p:g:hV", opts, &optidx))) {
 		if(opt < 0) {
@@ -441,6 +449,8 @@ void cleanup(int signum)
 		free(myip);
 	}
 
+	oath_done();
+
 	exit(signum);
 }
 
@@ -624,6 +634,9 @@ int parseconfig(char *configfile)
 				door->one_time_sequences_fd = NULL;
 				door->pcap_filter_exp = NULL;
 				door->pcap_filter_expv6 = NULL;
+				door->totp_secret   = NULL;
+				door->totp_digits   = 6;
+				door->last_ctr_seen = 0;
 				doors = list_add(doors, door);
 			}
 		} else {
@@ -684,6 +697,18 @@ int parseconfig(char *configfile)
 						}
 						strcpy(door->target, ptr);
 						dprint("config: %s: target: %s\n", door->name, door->target);
+          } else if(!strcmp(key, "TOTP_SECRET")) {
+            door->totp_secret = strdup(ptr);
+            door->totp_digits = 6;
+            door->seqcount    = 1;
+            door->protocol[0] = IPPROTO_TCP;
+						door_update_totp(door);
+					} else if(!strcmp(key, "TOTP_DIGITS")) {
+            door->totp_digits = atoi(ptr);
+            if(door->totp_digits!=6 && door->totp_digits!=8){
+              fprintf(stderr,"config: bad TOTP_DIGITS\n");
+              return 1;
+            }
 					} else if(!strcmp(key, "SEQUENCE")) {
 						int i;
 						i = parse_port_sequence(ptr, door);
@@ -799,6 +824,39 @@ int parseconfig(char *configfile)
 
 	return(0);
 }
+
+/*
+ */
+static void door_update_totp(opendoor_t *d)
+{
+	if(!d->totp_secret) return;
+
+	const time_t now   = time(NULL);
+	const uint64_t ctr = (uint64_t)(now / 30);
+	if(ctr == d->last_ctr_seen)   
+		// already used this one
+		return;
+
+	char code[10] = {0};
+	oath_totp_generate(
+			d->totp_secret,
+			strlen(d->totp_secret),
+			ctr,
+			d->totp_digits,
+			0,
+			code
+	);
+
+	unsigned int v = 0;
+	for (int i = 0; i < d->totp_digits; i++) {
+			unsigned int digit = (unsigned char)code[i] - '0';
+			/* mask to force into 0–9 even if code[i] is wrong */
+			digit &= 0x0F;
+			v = v * 10 + digit;
+	}
+	d->sequence[0] = (unsigned short)(v & 0xFFFF);
+}
+
 
 /* Parse a port:protocol sequence. Returns a positive integer on error.
  */
@@ -1291,6 +1349,7 @@ void free_door(opendoor_t *door)
 			fclose(door->one_time_sequences_fd);
 		}
 		free(door->pcap_filter_exp);
+		free(door->totp_secret);
 		free(door);
 	}
 }
@@ -1543,6 +1602,8 @@ void process_attempt(knocker_t *attempt)
 			vprint("%s: %s: OPEN SESAME\n", attempt->src, attempt->door->name);
 			logprint("%s: %s: OPEN SESAME", attempt->src, attempt->door->name);
 		}
+		if (attempt->door->totp_secret)
+			attempt->door->last_ctr_seen = (uint64_t)(time(NULL) / 30);
 		if(start_command && strlen(start_command)) {
 			/* run the associated command */
 			if(fork() == 0) {
@@ -1814,6 +1875,7 @@ void sniff(u_char* arg, const struct pcap_pkthdr* hdr, const u_char* packet)
 		found_attempt->data = NULL;
 
 		if(attempt) {
+			door_update_totp(attempt->door);
 			int flagsmatch = flags_match(attempt->door, ip_proto, tcp);
 			if(flagsmatch && ip_proto == attempt->door->protocol[attempt->stage] &&
 					dport == attempt->door->sequence[attempt->stage]) {
@@ -1832,6 +1894,7 @@ void sniff(u_char* arg, const struct pcap_pkthdr* hdr, const u_char* packet)
 			/* did they hit the first port correctly? */
 			for(lp = doors; lp; lp = lp->next) {
 				opendoor_t *door = (opendoor_t*)lp->data;
+				door_update_totp(door);
 				/* if we're working with TCP, try to match the flags */
 				if(!flags_match(door, ip_proto, tcp)) {
 					continue;
